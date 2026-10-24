@@ -1,27 +1,46 @@
+/*
+  ESP-12E / ESP8266 Fire and Gas Detector
+  Features:
+    - MQ-2 gas/smoke analog reading on A0
+    - Flame sensor digital output on D5
+    - Buzzer signal on D6
+    - Relay input on D1 (water pump activates on flame only)
+    - Local Wi-Fi web dashboard
+
+  IMPORTANT:
+    - Set your Wi-Fi credentials below.
+    - Confirm your relay's active level before connecting the pump.
+    - This is an educational prototype, not a certified fire safety system.
+    - Never use water on electrical, oil, or chemical fires.
+*/
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 
-// ---------- HOME WI-FI ----------
-const char* WIFI_SSID = "Your_Wifi_Name";
-const char* WIFI_PASSWORD = "Password";
+// -------- Wi-Fi settings --------
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
-// ---------- SENSOR AND OUTPUT PINS ----------
-const int GAS_PIN = A0;
-const int FLAME_PIN = D5;
-const int BUZZER_PIN = D6;
-const int RELAY_PIN = D1;
+// -------- Pin settings (NodeMCU labels) --------
+const uint8_t GAS_PIN = A0;
+const uint8_t FLAME_PIN = D5;
+const uint8_t BUZZER_PIN = D6;
+const uint8_t RELAY_PIN = D1;
 
-// ---------- CONFIGURATION ----------
-const int GAS_THRESHOLD = 100;  // Set your calibrated value
+// -------- Calibration / module settings --------
+// Tune this after observing MQ-2 readings in your environment.
+const int GAS_THRESHOLD = 450;
 
+// Many flame sensor modules pull DO LOW when flame is detected.
 const bool FLAME_ACTIVE_LOW = true;
 
-// Most relay modules are active LOW.
-// Verify this with your relay module before connecting the pump.
-const bool RELAY_ACTIVE_LOW = false;
+// Many relay modules are active LOW. Change to false if your relay is active HIGH.
+const bool RELAY_ACTIVE_LOW = true;
 
-// ---------- WEB SERVER ----------
+// Many active buzzer modules sound when SIG is HIGH.
+// If your buzzer module is active LOW, change this to false.
+const bool BUZZER_ACTIVE_HIGH = true;
+
 ESP8266WebServer server(80);
 
 int gasValue = 0;
@@ -29,232 +48,185 @@ bool flameDetected = false;
 bool gasDetected = false;
 bool alarmActive = false;
 bool pumpActive = false;
-bool serverStarted = false;
 
-unsigned long lastWiFiAttempt = 0;
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_INTERVAL_MS = 250;
 
-// ---------- MOBILE DASHBOARD ----------
-const char webpage[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#eef2f7">
-<title>Fire & Gas Monitor</title>
-<style>
-body {
-  margin: 0;
-  padding: 18px;
-  background: #eef2f7;
-  color: #172033;
-  font-family: Arial, sans-serif;
-}
-.container { max-width: 500px; margin: auto; }
-h1 { text-align: center; font-size: 25px; }
-.card {
-  background: white;
-  border-radius: 14px;
-  padding: 20px;
-  margin: 14px 0;
-  box-shadow: 0 3px 12px #0001;
-}
-.small { color: #64748b; font-size: 13px; }
-.value { font-size: 30px; font-weight: bold; margin-top: 8px; }
-.status { font-size: 21px; font-weight: bold; margin-top: 8px; }
-.normal { color: #13803c; }
-.danger { color: #d82020; }
-</style>
-</head>
-<body>
-<div class="container">
-  <h1>Fire & Gas Detector</h1>
-
-  <div class="card">
-    <div class="small">SYSTEM STATUS</div>
-    <div id="alarm" class="status">Connecting...</div>
-  </div>
-
-  <div class="card">
-    <div class="small">MQ-2 GAS READING</div>
-    <div class="value"><span id="gas">--</span> / 1023</div>
-    <div class="small">Threshold: <span id="threshold">--</span></div>
-    <div id="gasStatus" class="status">--</div>
-  </div>
-
-  <div class="card">
-    <div class="small">FLAME SENSOR</div>
-    <div id="flame" class="status">--</div>
-  </div>
-
-  <div class="card">
-    <div class="small">BUZZER</div>
-    <div id="buzzer" class="status">--</div>
-  </div>
-
-  <div class="card">
-    <div class="small">WATER PUMP</div>
-    <div id="pump" class="status">--</div>
-    <div class="small">Automatically controlled by flame detection</div>
-  </div>
-
-  <p id="connection" class="small" style="text-align:center">
-    Connecting to detector...
-  </p>
-  <p class="small" style="text-align:center">
-    Updates every 2 seconds
-  </p>
-</div>
-
-<script>
-async function updateStatus() {
-  try {
-    const response = await fetch('/data', {cache: 'no-store'});
-    if (!response.ok) throw new Error('Request failed');
-
-    const d = await response.json();
-
-    document.getElementById('gas').textContent = d.gas;
-    document.getElementById('threshold').textContent = d.threshold;
-
-    const alarm = document.getElementById('alarm');
-    alarm.textContent = d.alarm ? 'DANGER DETECTED' : 'NORMAL';
-    alarm.className = 'status ' + (d.alarm ? 'danger' : 'normal');
-
-    const gasStatus = document.getElementById('gasStatus');
-    gasStatus.textContent = d.gasDetected ? 'Gas threshold exceeded' : 'Gas normal';
-    gasStatus.className = 'status ' +
-      (d.gasDetected ? 'danger' : 'normal');
-
-    const flame = document.getElementById('flame');
-    flame.textContent = d.flame ? 'FLAME DETECTED' : 'No flame detected';
-    flame.className = 'status ' + (d.flame ? 'danger' : 'normal');
-
-    const buzzer = document.getElementById('buzzer');
-    buzzer.textContent = d.alarm ? 'ON' : 'OFF';
-    buzzer.className = 'status ' + (d.alarm ? 'danger' : 'normal');
-
-    const pump = document.getElementById('pump');
-    pump.textContent = d.pump ? 'ON' : 'OFF';
-    pump.className = 'status ' + (d.pump ? 'danger' : 'normal');
-
-    document.getElementById('connection').textContent =
-      'Connected to detector';
-  } catch (e) {
-    document.getElementById('connection').textContent =
-      'Connection lost. Retrying...';
+void setRelay(bool on) {
+  pumpActive = on;
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+  } else {
+    digitalWrite(RELAY_PIN, on ? HIGH : LOW);
   }
 }
 
-updateStatus();
-setInterval(updateStatus, 2000);
+void setBuzzer(bool on) {
+  if (BUZZER_ACTIVE_HIGH) {
+    digitalWrite(BUZZER_PIN, on ? HIGH : LOW);
+  } else {
+    digitalWrite(BUZZER_PIN, on ? LOW : HIGH);
+  }
+}
+
+void readSensors() {
+  gasValue = analogRead(GAS_PIN);
+  int flameState = digitalRead(FLAME_PIN);
+
+  flameDetected = FLAME_ACTIVE_LOW ? (flameState == LOW) : (flameState == HIGH);
+  gasDetected = (gasValue >= GAS_THRESHOLD);
+
+  // Alarm for either gas or flame; pump only for flame.
+  alarmActive = gasDetected || flameDetected;
+  setBuzzer(alarmActive);
+  setRelay(flameDetected);
+}
+
+String jsonBool(bool value) {
+  return value ? "true" : "false";
+}
+
+void handleRoot() {
+  const char page[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP-12E Fire & Gas Monitor</title>
+<style>
+  body{font-family:Arial,sans-serif;margin:0;background:#f3f6fb;color:#172033}
+  header{background:#172b4d;color:#fff;padding:22px 16px;text-align:center}
+  main{max-width:760px;margin:20px auto;padding:0 14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px}
+  .card{background:#fff;border-radius:14px;padding:18px;box-shadow:0 3px 12px #15284b14}
+  .label{color:#637083;font-size:14px}
+  .value{font-size:25px;font-weight:bold;margin-top:8px}
+  .status{font-weight:bold}
+  .safe{color:#16803c}.danger{color:#c62828}
+  footer{text-align:center;color:#64748b;font-size:12px;padding:18px}
+</style>
+</head>
+<body>
+<header><h1>🔥 Fire & Gas Monitor</h1><p>ESP8266 NodeMCU ESP-12E</p></header>
+<main>
+  <div class="grid">
+    <section class="card"><div class="label">MQ-2 Gas Sensor</div><div class="value" id="gasValue">--</div><p id="gasStatus" class="status">Reading...</p></section>
+    <section class="card"><div class="label">Flame Sensor</div><div class="value" id="flameStatus">--</div><p>Digital sensor status</p></section>
+    <section class="card"><div class="label">Buzzer Alarm</div><div class="value" id="alarmStatus">--</div><p>Activates for gas or flame</p></section>
+    <section class="card"><div class="label">Water Pump Relay</div><div class="value" id="pumpStatus">--</div><p>Activates for flame detection only</p></section>
+  </div>
+  <section class="card" style="margin-top:14px"><div class="label">System status</div><div class="value" id="systemStatus">Connecting...</div><p>Updates automatically every 2 seconds.</p></section>
+</main>
+<footer>Educational prototype only — not a certified fire safety system.</footer>
+<script>
+async function updateData(){
+  try{
+    const response=await fetch('/data',{cache:'no-store'});
+    const d=await response.json();
+    document.getElementById('gasValue').textContent=d.gasValue;
+    document.getElementById('gasStatus').textContent=d.gasDetected?'GAS/SMOKE ALERT':'Below configured threshold';
+    document.getElementById('gasStatus').className='status '+(d.gasDetected?'danger':'safe');
+    document.getElementById('flameStatus').textContent=d.flameDetected?'DETECTED':'Not detected';
+    document.getElementById('flameStatus').className='value '+(d.flameDetected?'danger':'safe');
+    document.getElementById('alarmStatus').textContent=d.alarmActive?'ON':'OFF';
+    document.getElementById('alarmStatus').className='value '+(d.alarmActive?'danger':'safe');
+    document.getElementById('pumpStatus').textContent=d.pumpActive?'ON':'OFF';
+    document.getElementById('pumpStatus').className='value '+(d.pumpActive?'danger':'safe');
+    document.getElementById('systemStatus').textContent=d.flameDetected?'FLAME ALERT':(d.gasDetected?'GAS/SMOKE ALERT':'Monitoring');
+    document.getElementById('systemStatus').className='value '+((d.flameDetected||d.gasDetected)?'danger':'safe');
+  }catch(e){
+    document.getElementById('systemStatus').textContent='Connection lost — retrying';
+    document.getElementById('systemStatus').className='value danger';
+  }
+}
+updateData(); setInterval(updateData,2000);
 </script>
 </body>
 </html>
 )rawliteral";
-
-// ---------- WEB HANDLERS ----------
-void handleHome() {
-  server.send_P(200, "text/html", webpage);
+  server.send_P(200, "text/html", page);
 }
 
 void handleData() {
   String json = "{";
-  json += "\"gas\":" + String(gasValue) + ",";
-  json += "\"threshold\":" + String(GAS_THRESHOLD) + ",";
-  json += "\"gasDetected\":";
-  json += (gasDetected ? "true" : "false");
-  json += ",\"flame\":";
-  json += (flameDetected ? "true" : "false");
-  json += ",\"alarm\":";
-  json += (alarmActive ? "true" : "false");
-  json += ",\"pump\":";
-  json += (pumpActive ? "true" : "false");
+  json += "\"gasValue\":" + String(gasValue) + ",";
+  json += "\"gasDetected\":" + jsonBool(gasDetected) + ",";
+  json += "\"flameDetected\":" + jsonBool(flameDetected) + ",";
+  json += "\"alarmActive\":" + jsonBool(alarmActive) + ",";
+  json += "\"pumpActive\":" + jsonBool(pumpActive);
   json += "}";
-
-  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
-void startWebServer() {
-  server.on("/", HTTP_GET, handleHome);
-  server.on("/data", HTTP_GET, handleData);
-  server.begin();
-
-  serverStarted = true;
-
-  Serial.println();
-  Serial.println("Web server started.");
-  Serial.print("Open on your phone: http://");
-  Serial.println(WiFi.localIP());
-}
-
-// ---------- SETUP ----------
-void setup() {
-  Serial.begin(115200);
-
-  pinMode(FLAME_PIN, INPUT_PULLUP);
-
-  // Set pump OFF before enabling the relay output.
-  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
-  pinMode(RELAY_PIN, OUTPUT);
-
-  pinMode(BUZZER_PIN, OUTPUT);
-  noTone(BUZZER_PIN);
-
+void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
+  Serial.print("Connecting to Wi-Fi");
+  unsigned long startAttempt = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
   Serial.println();
-  Serial.println("Fire and Gas Detector starting...");
-  Serial.println("Connecting to Wi-Fi...");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected. Dashboard URL: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Wi-Fi connection failed. Will retry in loop.");
+  }
 }
 
-// ---------- MAIN LOOP ----------
+unsigned long lastWiFiAttempt = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(FLAME_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  // Put outputs into OFF state before starting the sensors/server.
+  setBuzzer(false);
+  setRelay(false);
+
+  Serial.println();
+  Serial.println(F("ESP-12E Fire and Gas Detector starting..."));
+  Serial.print(F("Gas threshold: "));
+  Serial.println(GAS_THRESHOLD);
+
+  connectWiFi();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.begin();
+  Serial.println(F("Web server started on port 80."));
+}
+
 void loop() {
-  // Read sensors continuously.
-  gasValue = analogRead(GAS_PIN);
-  gasDetected = gasValue >= GAS_THRESHOLD;
+  server.handleClient();
 
-  int flameReading = digitalRead(FLAME_PIN);
+  if (millis() - lastSensorRead >= SENSOR_INTERVAL_MS) {
+    lastSensorRead = millis();
+    readSensors();
 
-  flameDetected = FLAME_ACTIVE_LOW
-                  ? (flameReading == LOW)
-                  : (flameReading == HIGH);
-
-  alarmActive = gasDetected || flameDetected;
-
-  // Local buzzer responds to either gas or flame.
-  if (alarmActive) {
-    tone(BUZZER_PIN, 2000);
-  } else {
-    noTone(BUZZER_PIN);
+    Serial.print(F("Gas: "));
+    Serial.print(gasValue);
+    Serial.print(F(" | Gas alert: "));
+    Serial.print(gasDetected ? F("YES") : F("NO"));
+    Serial.print(F(" | Flame: "));
+    Serial.print(flameDetected ? F("YES") : F("NO"));
+    Serial.print(F(" | Pump: "));
+    Serial.println(pumpActive ? F("ON") : F("OFF"));
   }
 
-  // Pump activates only for flame detection, not gas alone.
-  pumpActive = flameDetected;
-
-  digitalWrite(
-    RELAY_PIN,
-    pumpActive
-      ? (RELAY_ACTIVE_LOW ? LOW : HIGH)
-      : (RELAY_ACTIVE_LOW ? HIGH : LOW)
-  );
-
-  // Start server after Wi-Fi connects.
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!serverStarted) {
-      startWebServer();
-    }
-
-    server.handleClient();
-  } else {
-    if (millis() - lastWiFiAttempt >= 10000) {
-      lastWiFiAttempt = millis();
-      Serial.println("Wi-Fi disconnected; reconnecting...");
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWiFiAttempt >= 10000) {
+    lastWiFiAttempt = millis();
+    Serial.println(F("Wi-Fi disconnected. Retrying..."));
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
-
-  delay(10);
 }
